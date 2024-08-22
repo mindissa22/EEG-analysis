@@ -1,18 +1,17 @@
-import argparse
 import os
 import numpy as np
 import scipy.io as sio
-from sklearn.preprocessing import StandardScaler
-from torch.utils.data import Dataset, DataLoader
+import mne
+from mne import create_info
+from mne.io import RawArray
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch import Tensor
-from einops.layers.torch import Rearrange
-from mne import create_info
-from mne.io import RawArray
-
-# Preprocessing functions
+from torch.utils.data import Dataset, DataLoader
+from sklearn.preprocessing import StandardScaler
+from einops.layers.torch import Rearrange, Reduce
+import matplotlib.pyplot as plt
+ 
 def preprocess_eeg_data(base_path):
     data_files = {
         'Control': [],
@@ -90,6 +89,8 @@ def preprocess_eeg_data(base_path):
     
     return control_data, adhd_data
  
+ 
+# Standardising data
 def standardize_data(train_data, test_data):
     scaler = StandardScaler()
     train_data_reshaped = train_data.reshape(-1, train_data.shape[-1])
@@ -97,7 +98,6 @@ def standardize_data(train_data, test_data):
     train_data_standardized = scaler.transform(train_data_reshaped).reshape(train_data.shape)
     test_data_standardized = scaler.transform(test_data.reshape(-1, test_data.shape[-1])).reshape(test_data.shape)
     return train_data_standardized, test_data_standardized
-
  
 # Defining the EEGDataset class
 class EEGDataset(Dataset):
@@ -110,192 +110,203 @@ class EEGDataset(Dataset):
  
     def __getitem__(self, idx):
         return self.data[idx], self.labels[idx]
-
-# Model Components
+ 
+# Defining the Conformer model components
 class PatchEmbedding(nn.Module):
-    def __init__(self, in_channels, out_channels):
+    def __init__(self, emb_size=40):
         super().__init__()
-        self.conv = nn.Conv1d(in_channels, out_channels, kernel_size=5, stride=2, padding=2)
-        self.pool = nn.MaxPool1d(kernel_size=2, stride=2)
-    
+        self.shallownet = nn.Sequential(
+            nn.Conv2d(1, 40, (1, 20), (1, 1)),
+            nn.BatchNorm2d(40),
+            nn.ELU(),
+            nn.Conv2d(40, 40, (1, 15), (1, 1)),
+            nn.BatchNorm2d(40),
+            nn.ELU(),
+            nn.AvgPool2d((1, 20), (1, 10)),
+            nn.Dropout(0.5),
+        )
+        self.projection = nn.Sequential(
+            nn.Conv2d(40, emb_size, (1, 1), stride=(1, 1)),
+            Rearrange('b e (h) (w) -> b (h w) e'),
+        )
+ 
     def forward(self, x):
-        x = self.conv(x)
-        x = F.relu(x)
-        x = self.pool(x)
+        if x.dim() == 3:  # Handle cases where x is 3D
+            x = x.unsqueeze(1)  # Adding a dummy channel dimension
+        b, _, _, _ = x.shape
+        x = self.shallownet(x)
+        x = self.projection(x)
         return x
-
-
+ 
+from einops import rearrange
+ 
 class MultiHeadAttention(nn.Module):
-    def __init__(self, embed_dim, num_heads):
+    def __init__(self, emb_size, num_heads, dropout):
         super().__init__()
-        self.attention = nn.MultiheadAttention(embed_dim, num_heads)
-    
-    def forward(self, x):
-        x = x.permute(2, 0, 1)  # MultiheadAttention expects (seq_len, batch, embed_dim)
-        x, _ = self.attention(x, x, x)
-        x = x.permute(1, 2, 0)  # Convert back to (batch, embed_dim, seq_len)
-        return x
-
-
+        self.emb_size = emb_size
+        self.num_heads = num_heads
+        self.keys = nn.Linear(emb_size, emb_size)
+        self.queries = nn.Linear(emb_size, emb_size)
+        self.values = nn.Linear(emb_size, emb_size)
+        self.att_drop = nn.Dropout(dropout)
+        self.projection = nn.Linear(emb_size, emb_size)
+ 
+    def forward(self, x, mask=None):
+        queries = self.queries(x)
+        keys = self.keys(x)
+        values = self.values(x)
+ 
+        # Rearranging tensors to split into multiple heads
+        queries = rearrange(queries, "b n (h d) -> b h n d", h=self.num_heads)
+        keys = rearrange(keys, "b n (h d) -> b h n d", h=self.num_heads)
+        values = rearrange(values, "b n (h d) -> b h n d", h=self.num_heads)
+ 
+        energy = torch.einsum('bhqd, bhkd -> bhqk', queries, keys)
+        if mask is not None:
+            fill_value = torch.finfo(torch.float32).min
+            energy.mask_fill(~mask, fill_value)
+        scaling = self.emb_size ** (1 / 2)
+        att = F.softmax(energy / scaling, dim=-1)
+        att = self.att_drop(att)
+        out = torch.einsum('bhal, bhlv -> bhav', att, values)
+        out = rearrange(out, "b h n d -> b n (h d)")
+        out = self.projection(out)
+        return out
+ 
+ 
 class ResidualAdd(nn.Module):
-    def __init__(self, layer):
+    def __init__(self, fn):
         super().__init__()
-        self.layer = layer
-    
-    def forward(self, x):
-        return x + self.layer(x)
-
-class FeedForwardBlock(nn.Module):
-    def __init__(self, embed_dim, ff_dim, dropout=0.1):
-        super().__init__()
-        self.fc1 = nn.Linear(embed_dim, ff_dim)
-        self.dropout = nn.Dropout(dropout)
-        self.fc2 = nn.Linear(ff_dim, embed_dim)
-    
-    def forward(self, x):
-        x = F.relu(self.fc1(x))
-        x = self.dropout(x)
-        x = self.fc2(x)
+        self.fn = fn
+ 
+    def forward(self, x, **kwargs):
+        res = x
+        x = self.fn(x, **kwargs)
+        x += res
         return x
-
-class TransformerEncoderBlock(nn.Module):
-    def __init__(self, embed_dim, num_heads, ff_dim, dropout=0.1):
+ 
+class FeedForwardBlock(nn.Sequential):
+    def __init__(self, emb_size, expansion, drop_p):
+        super().__init__(
+            nn.Linear(emb_size, expansion * emb_size),
+            nn.GELU(),
+            nn.Dropout(drop_p),
+            nn.Linear(expansion * emb_size, emb_size),
+        )
+ 
+class TransformerEncoderBlock(nn.Sequential):
+    def __init__(self, emb_size, num_heads=10, drop_p=0.5, forward_expansion=4, forward_drop_p=0.5):
+        super().__init__(
+            ResidualAdd(nn.Sequential(
+                nn.LayerNorm(emb_size),
+                MultiHeadAttention(emb_size, num_heads, drop_p),
+                nn.Dropout(drop_p)
+            )),
+            ResidualAdd(nn.Sequential(
+                nn.LayerNorm(emb_size),
+                FeedForwardBlock(emb_size, expansion=forward_expansion, drop_p=forward_drop_p),
+                nn.Dropout(drop_p)
+            ))
+        )
+ 
+class TransformerEncoder(nn.Sequential):
+    def __init__(self, depth, emb_size):
+        super().__init__(*[TransformerEncoderBlock(emb_size) for _ in range(depth)])
+ 
+class ClassificationHead(nn.Sequential):
+    def __init__(self, emb_size, n_classes):
         super().__init__()
-        self.attention = MultiHeadAttention(embed_dim, num_heads)
-        self.residual1 = ResidualAdd(self.attention)
-        self.ff = FeedForwardBlock(embed_dim, ff_dim, dropout)
-        self.residual2 = ResidualAdd(self.ff)
-    
+        self.clshead = nn.Sequential(
+            Reduce('b n e -> b e', reduction='mean'),
+            nn.LayerNorm(emb_size),
+            nn.Linear(emb_size, n_classes)
+        )
+ 
     def forward(self, x):
-        x = self.residual1(x)
-        x = self.residual2(x)
-        return x
-
-class TransformerEncoder(nn.Module):
-    def __init__(self, embed_dim, num_layers, num_heads, ff_dim, dropout=0.1):
-        super().__init__()
-        self.layers = nn.ModuleList([
-            TransformerEncoderBlock(embed_dim, num_heads, ff_dim, dropout)
-            for _ in range(num_layers)
-        ])
-    
-    def forward(self, x):
-        for layer in self.layers:
-            x = layer(x)
-        return x
-
-class ClassificationHead(nn.Module):
-    def __init__(self, embed_dim, num_classes, dropout=0.1):
-        super().__init__()
-        self.fc1 = nn.Linear(embed_dim, embed_dim)
-        self.dropout = nn.Dropout(dropout)
-        self.fc2 = nn.Linear(embed_dim, num_classes)
-    
-    def forward(self, x):
-        x = F.relu(self.fc1(x))
-        x = self.dropout(x)
-        x = self.fc2(x)
-        return x
-
+        x = x.contiguous().view(x.size(0), -1)
+        out = self.clshead(x)
+        return out
+ 
 class Conformer(nn.Module):
-    def __init__(self, num_classes):
+    def __init__(self, emb_size=40, depth=6, n_classes=2):
         super().__init__()
-        self.patch_embedding = PatchEmbedding(in_channels=19, out_channels=64)
-        self.transformer_encoder = TransformerEncoder(embed_dim=2000, num_layers=4, num_heads=8, ff_dim=128)
-        self.classification_head = ClassificationHead(embed_dim=2000, num_classes=num_classes)
-    
+        self.patch_embedding = PatchEmbedding(emb_size)
+        self.transformer = TransformerEncoder(depth, emb_size)
+        self.classifier = ClassificationHead(emb_size, n_classes)
+ 
     def forward(self, x):
         x = self.patch_embedding(x)
-        x = x.permute(0, 2, 1)  # Permute for transformer
-        x = self.transformer_encoder(x)
-        x = x.mean(dim=1)  # Global average pooling
-        x = self.classification_head(x)
+        x = self.transformer(x)
+        x = self.classifier(x)
         return x
-
-# Experiment Class
-class ExP:
-    def __init__(self, subject):
-        self.subject = subject
-        self.base_path = "/Users/minolidissanayake/Desktop/Keele/Modules/SEM 3/Dataset"
-        self.num_classes = 2  # Control and ADHD
-
-        # Preprocess and load data
-        control_data, adhd_data = preprocess_eeg_data(self.base_path)
-        self.train_data, self.test_data = self.split_data(control_data, adhd_data)
-        self.train_data, self.test_data = self.standardize_data(self.train_data, self.test_data)
-        
-        # Create datasets
-        self.train_dataset = EEGDataset(self.train_data, [0] * len(control_data) + [1] * len(adhd_data))
-        self.test_dataset = EEGDataset(self.test_data, [0] * len(control_data) + [1] * len(adhd_data))
-
-        self.train_loader = DataLoader(self.train_dataset, batch_size=32, shuffle=True)
-        self.test_loader = DataLoader(self.test_dataset, batch_size=32, shuffle=False)
-
-        # Model, loss, optimizer
-        self.model = Conformer(num_classes=self.num_classes)
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=0.001)
-        self.scheduler = torch.optim.lr_scheduler.StepLR(self.optimizer, step_size=10, gamma=0.7)
-        self.loss_fn = nn.CrossEntropyLoss()
-
-    def split_data(self, control_data, adhd_data):
-        split_idx_control = int(len(control_data) * 0.8)
-        split_idx_adhd = int(len(adhd_data) * 0.8)
-        
-        train_control = control_data[:split_idx_control]
-        test_control = control_data[split_idx_control:]
-        train_adhd = adhd_data[:split_idx_adhd]
-        test_adhd = adhd_data[split_idx_adhd:]
-
-        train_data = np.concatenate([train_control, train_adhd], axis=0)
-        test_data = np.concatenate([test_control, test_adhd], axis=0)
-
-        return train_data, test_data
-
-    def standardize_data(self, train_data, test_data):
-        scaler = StandardScaler()
-        train_data_reshaped = train_data.reshape(-1, train_data.shape[-1])
-        scaler.fit(train_data_reshaped)
-        train_data_standardized = scaler.transform(train_data_reshaped).reshape(train_data.shape)
-        test_data_standardized = scaler.transform(test_data.reshape(-1, test_data.shape[-1])).reshape(test_data.shape)
-        return train_data_standardized, test_data_standardized
-
-    def train(self, epochs=10):
-        self.model.train()
-        for epoch in range(epochs):
-            for batch_data, batch_labels in self.train_loader:
-                self.optimizer.zero_grad()
-                outputs = self.model(batch_data)
-                loss = self.loss_fn(outputs, batch_labels)
-                loss.backward()
-                self.optimizer.step()
-
-            self.scheduler.step()
-            print(f'Epoch {epoch+1}/{epochs}, Loss: {loss.item()}')
-
-            # Save model checkpoint
-            torch.save(self.model.state_dict(), f'model_epoch_{epoch+1}.pth')
-
-    def evaluate(self):
-        self.model.eval()
+ 
+# Model Training and evaluation
+def train_and_evaluate(model, train_loader, test_loader, n_epochs=20, lr=0.001):
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model.to(device)
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+ 
+    for epoch in range(n_epochs):
+        model.train()
+        running_loss = 0.0
+        for inputs, labels in train_loader:
+            inputs, labels = inputs.to(device), labels.to(device)
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+            running_loss += loss.item() * inputs.size(0)
+ 
+        epoch_loss = running_loss / len(train_loader.dataset)
+        print(f'Epoch {epoch+1}/{n_epochs}, Loss: {epoch_loss:.4f}')
+ 
+        # Evaluating on the test set
+        model.eval()
         correct = 0
         total = 0
         with torch.no_grad():
-            for batch_data, batch_labels in self.test_loader:
-                outputs = self.model(batch_data)
-                _, predicted = torch.max(outputs.data, 1)
-                total += batch_labels.size(0)
-                correct += (predicted == batch_labels).sum().item()
-        
+            for inputs, labels in test_loader:
+                inputs, labels = inputs.to(device), labels.to(device)
+                outputs = model(inputs)
+                _, predicted = torch.max(outputs, 1)
+                total += labels.size(0)
+                correct += (predicted == labels).sum().item()
+ 
         accuracy = correct / total
-        print(f'Accuracy: {accuracy * 100:.2f}%')
-        return accuracy
-
+        print(f'Test Accuracy: {accuracy:.4f}')
+ 
+# Main function
+def main():
+    base_path = '/Users/minolidissanayake/Desktop/Keele/Modules/SEM 3/Dataset'  
+    control_data, adhd_data = preprocess_eeg_data(base_path)
+    
+    # Creating labels: 0 for Control, 1 for ADHD
+    control_labels = np.zeros(control_data.shape[0])
+    adhd_labels = np.ones(adhd_data.shape[0])
+    
+    # Combining data and labels
+    data = np.concatenate((control_data, adhd_data), axis=0)
+    labels = np.concatenate((control_labels, adhd_labels), axis=0)
+    
+    # Standardiding the data
+    data_standardized, _ = standardize_data(data, data)
+    
+    # Splitting data into training and testing sets
+    split_index = int(0.8 * len(data_standardized))
+    train_data, test_data = data_standardized[:split_index], data_standardized[split_index:]
+    train_labels, test_labels = labels[:split_index], labels[split_index:]
+    
+    # Creating datasets and dataloaders
+    train_dataset = EEGDataset(train_data, train_labels)
+    test_dataset = EEGDataset(test_data, test_labels)
+    train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True)
+    test_loader = DataLoader(test_dataset, batch_size=16, shuffle=False)
+    
+    # Initialising and train the model
+    model = Conformer()
+    train_and_evaluate(model, train_loader, test_loader)
+ 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='Train a Conformer model on EEG data.')
-    parser.add_argument('subject', type=int, help='Subject number')
-    args = parser.parse_args()
-
-    exp = ExP(subject=args.subject)
-    exp.train(epochs=10)
-    exp.evaluate()
-
+    main()
