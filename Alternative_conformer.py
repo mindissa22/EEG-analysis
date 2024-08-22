@@ -131,9 +131,9 @@ class MultiHeadAttention(nn.Module):
         self.attention = nn.MultiheadAttention(embed_dim, num_heads)
     
     def forward(self, x):
-        x = x.permute(2, 0, 1)  # MultiheadAttention expects (seq_len, batch, embed_dim)
+        x = x.permute(2, 0, 1)  
         x, _ = self.attention(x, x, x)
-        x = x.permute(1, 2, 0)  # Convert back to (batch, embed_dim, seq_len)
+        x = x.permute(1, 2, 0)  
         return x
 
 
@@ -298,4 +298,3 @@ if __name__ == "__main__":
     exp = ExP(subject=args.subject)
     exp.train(epochs=10)
     exp.evaluate()
-
